@@ -120,17 +120,17 @@ def delete_link(code):
 
 # ─── Redirect ────────────────────────────────────────────────────
 
-@app.route("/<code>")
-def redirect_short(code):
-    if code in ("admin", "favicon.ico") or code.startswith("api"):
+@app.route("/<short_code>")
+def redirect_short(short_code):
+    if short_code in ("admin", "favicon.ico") or short_code.startswith("api"):
         abort(404)
-    if not is_valid_code(code):
+    if not is_valid_code(short_code):
         abort(404)
     with get_db() as conn:
-        row = conn.execute("SELECT original FROM links WHERE code = ?", (code,)).fetchone()
+        row = conn.execute("SELECT original FROM links WHERE code = ?", (short_code,)).fetchone()
         if not row:
             abort(404)
-        conn.execute("UPDATE links SET clicks = clicks + 1 WHERE code = ?", (code,))
+        conn.execute("UPDATE links SET clicks = clicks + 1 WHERE code = ?", (short_code,))
     return redirect(row["original"], code=301)
 
 
@@ -318,25 +318,27 @@ async function shortenLink() {
         const res = await fetch("/api/shorten", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ url, code: code || undefined })
+            body: JSON.stringify({ url: url, code: code || undefined })
         });
         const data = await res.json();
 
         if (!res.ok) {
             showError(data.error || "Error al acortar");
+            btn.disabled = false;
+            btn.textContent = "Acortar";
             return;
         }
 
-        copyToClipboard(location.protocol + "//" + DOMAIN + "/" + data.short);
+        const shortUrl = location.protocol + "//" + DOMAIN + "/" + data.short;
+        copyToClipboard(shortUrl);
         urlInput.value = "";
         codeInput.value = "";
         await loadLinks();
     } catch (err) {
-        showError("Error de conexión con el servidor");
-    } finally {
-        btn.disabled = false;
-        btn.textContent = "Acortar";
+        showError("Error de conexión: " + err.message);
     }
+    btn.disabled = false;
+    btn.textContent = "Acortar";
 }
 
 async function deleteLink(code) {
@@ -398,11 +400,41 @@ function renderLinks() {
 }
 
 function copyToClipboard(text) {
-    navigator.clipboard.writeText(text).then(() => {
-        const t = document.getElementById("toast");
-        t.classList.add("show");
-        setTimeout(() => t.classList.remove("show"), 1800);
-    });
+    try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(() => {
+                showToast();
+            }).catch(() => {
+                fallbackCopy(text);
+            });
+        } else {
+            fallbackCopy(text);
+        }
+    } catch (err) {
+        fallbackCopy(text);
+    }
+}
+
+function fallbackCopy(text) {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+        document.execCommand("copy");
+        showToast();
+    } catch (e) {
+        showError("No se pudo copiar. Tu link: " + text);
+    }
+    document.body.removeChild(ta);
+}
+
+function showToast() {
+    const t = document.getElementById("toast");
+    t.classList.add("show");
+    setTimeout(() => t.classList.remove("show"), 1800);
 }
 
 function showError(msg) {
