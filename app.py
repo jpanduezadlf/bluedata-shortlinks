@@ -1,33 +1,37 @@
 """
 Bluedata Short Links
 """
-import os, string, secrets, sqlite3
+import os, string, secrets
+import psycopg2
 from flask import Flask, request, jsonify, redirect, abort, send_from_directory
 
 app = Flask(__name__, static_folder="static")
 
-DB_PATH = os.environ.get("SHORTLINKS_DB", "shortlinks.db")
+DATABASE_URL = os.environ["DATABASE_URL"]
 ALLOWED_CHARS = string.ascii_letters + string.digits
 CODE_LENGTH = 5
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = True
     return conn
 
 def init_db():
-    with get_db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS links (
-                code       TEXT PRIMARY KEY,
-                original   TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                clicks     INTEGER NOT NULL DEFAULT 0
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_original ON links(original)")
-    print(f"[OK] DB inicializada en {DB_PATH}")
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS links (
+                    code       TEXT PRIMARY KEY,
+                    original   TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    clicks     INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_original ON links(original)")
+    finally:
+        conn.close()
+    print("[OK] DB inicializada en Neon PostgreSQL")
 
 def generate_code(length=CODE_LENGTH):
     return ''.join(secrets.choice(ALLOWED_CHARS) for _ in range(length))
@@ -55,43 +59,58 @@ def shorten():
     if not is_valid_url(url):
         return jsonify({"error": "URL invalida. Debe comenzar con http:// o https://"}), 400
 
-    with get_db() as conn:
-        existing = conn.execute("SELECT code FROM links WHERE original = ?", (url,)).fetchone()
-        if existing:
-            return jsonify({"short": existing["code"], "url": url, "exists": True})
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT code FROM links WHERE original = %s", (url,))
+            existing = cur.fetchone()
+            if existing:
+                return jsonify({"short": existing[0], "url": url, "exists": True})
 
-        if custom_code:
-            if not is_valid_code(custom_code):
-                return jsonify({"error": "Codigo invalido. Solo letras, numeros, - y _ (max 30)"}), 400
-            if conn.execute("SELECT 1 FROM links WHERE code = ?", (custom_code,)).fetchone():
-                return jsonify({"error": "El codigo '" + custom_code + "' ya esta en uso"}), 409
-            code = custom_code
-        else:
-            for _ in range(20):
-                code = generate_code()
-                if not conn.execute("SELECT 1 FROM links WHERE code = ?", (code,)).fetchone():
-                    break
+            if custom_code:
+                if not is_valid_code(custom_code):
+                    return jsonify({"error": "Codigo invalido. Solo letras, numeros, - y _ (max 30)"}), 400
+                cur.execute("SELECT 1 FROM links WHERE code = %s", (custom_code,))
+                if cur.fetchone():
+                    return jsonify({"error": "El codigo '" + custom_code + "' ya esta en uso"}), 409
+                code = custom_code
             else:
-                return jsonify({"error": "No se pudo generar codigo. Intenta de nuevo."}), 500
+                for _ in range(20):
+                    code = generate_code()
+                    cur.execute("SELECT 1 FROM links WHERE code = %s", (code,))
+                    if not cur.fetchone():
+                        break
+                else:
+                    return jsonify({"error": "No se pudo generar codigo. Intenta de nuevo."}), 500
 
-        conn.execute("INSERT INTO links (code, original) VALUES (?, ?)", (code, url))
+            cur.execute("INSERT INTO links (code, original) VALUES (%s, %s)", (code, url))
+    finally:
+        conn.close()
 
     return jsonify({"short": code, "url": url, "exists": False}), 201
 
 @app.route("/api/links", methods=["GET"])
 def list_links():
-    with get_db() as conn:
-        rows = conn.execute(
-            "SELECT code, original, created_at, clicks FROM links ORDER BY created_at DESC"
-        ).fetchall()
-    return jsonify([dict(r) for r in rows])
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT code, original, created_at, clicks FROM links ORDER BY created_at DESC")
+            columns = [desc[0] for desc in cur.description]
+            rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+    finally:
+        conn.close()
+    return jsonify(rows)
 
 @app.route("/api/links/<link_code>", methods=["DELETE"])
 def delete_link(link_code):
-    with get_db() as conn:
-        result = conn.execute("DELETE FROM links WHERE code = ?", (link_code,))
-        if result.rowcount == 0:
-            return jsonify({"error": "Link no encontrado"}), 404
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM links WHERE code = %s", (link_code,))
+            if cur.rowcount == 0:
+                return jsonify({"error": "Link no encontrado"}), 404
+    finally:
+        conn.close()
     return jsonify({"deleted": link_code})
 
 # ─── Admin panel ─────────────────────────────────────────────────
@@ -108,12 +127,17 @@ def redirect_short(short_code):
         abort(404)
     if not is_valid_code(short_code):
         abort(404)
-    with get_db() as conn:
-        row = conn.execute("SELECT original FROM links WHERE code = ?", (short_code,)).fetchone()
-        if not row:
-            abort(404)
-        conn.execute("UPDATE links SET clicks = clicks + 1 WHERE code = ?", (short_code,))
-    return redirect(row["original"], code=301)
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT original FROM links WHERE code = %s", (short_code,))
+            row = cur.fetchone()
+            if not row:
+                abort(404)
+            cur.execute("UPDATE links SET clicks = clicks + 1 WHERE code = %s", (short_code,))
+    finally:
+        conn.close()
+    return redirect(row[0], code=301)
 
 # ─── 404 ─────────────────────────────────────────────────────────
 
